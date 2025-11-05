@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Dict, Any, List, Optional, Tuple
 import os
 import re
+from pdsp.normalize import canonical_key, normalize_awg_or_mm2
 
 # Try importing pdfplumber; fall back gracefully if not installed
 try:
@@ -193,35 +194,6 @@ def _looks_like_m12_catalog(text: str) -> bool:
     return any(h in t for h in hints)
 
 
-# map AWG → mm² approximate conversion
-_AWG_TO_MM2 = {28: 0.081, 26: 0.129, 24: 0.205, 22: 0.326, 20: 0.518, 18: 0.823, 16: 1.31, 14: 2.08}
-
-
-def _normalize_wire_gauge_to_mm2(fragment: str) -> Tuple[Optional[float], Optional[str], str]:
-    """
-    Convert 'AWG N' or 'X mm²' to numeric mm² if possible.
-    Returns (value_mm2, unit, raw_string).
-    """
-    t = fragment.strip()
-
-    # --- AWG pattern ---
-    m_awg = _rx_first(r"AWG\s*(\d{1,2})", t)
-    if m_awg:
-        awg = int(m_awg.group(1))
-        mm2 = _AWG_TO_MM2.get(awg)
-        if mm2 is not None:
-            return mm2, "mm2", t
-
-    # --- plain mm² pattern ---
-    m_mm = _rx_first(r"(\d+(?:[.,]\d+)?)\s*mm(?:2|²)", t)
-    if m_mm:
-        val = _try_parse_float(m_mm.group(1))
-        if val is not None:
-            return val, "mm2", t
-
-    return None, None, t
-
-
 def _parse_m12_catalog(pdf_path: str, text: str) -> List[Dict[str, Any]]:
     """
     Parse the M12 Sensor/Aktorik catalog into structured variants.
@@ -246,14 +218,14 @@ def _parse_m12_catalog(pdf_path: str, text: str) -> List[Dict[str, Any]]:
         base_specs.append({"spec_key": "temp_min_c", "spec_value_num": float(min(nums)), "unit": "°C", "raw": str(nums)})
         base_specs.append({"spec_key": "temp_max_c", "spec_value_num": float(max(nums)), "unit": "°C", "raw": str(nums)})
 
-    # --- Wire gauge ---
+    # --- Wire gauge (normalized through shared helper) ---
     wg_m = _rx_first(r"(AWG\s*\d{1,2}|\d+(?:[.,]\d+)?\s*mm(?:2|²))", text)
     if wg_m:
-        val, unit, raw = _normalize_wire_gauge_to_mm2(wg_m.group(1))
+        val, unit, raw = normalize_awg_or_mm2(wg_m.group(1))
         if val is not None:
-            base_specs.append({"spec_key": "wire_gauge_mm2", "spec_value_num": val, "unit": "mm2", "raw": raw})
+            base_specs.append({"spec_key": "wire_gauge_mm2", "spec_value_num": val, "unit": unit or "mm2", "raw": raw})
         else:
-            base_specs.append({"spec_key": "wire_gauge_mm2", "spec_value_text": raw, "unit": "mm2", "raw": raw})
+            base_specs.append({"spec_key": "wire_gauge_mm2", "spec_value_text": raw, "unit": unit or "mm2", "raw": raw})
 
     # --- Build product entries ---
     if ordering_codes:

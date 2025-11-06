@@ -204,7 +204,11 @@ def _parse_m12_catalog(pdf_path: str, text: str) -> List[Dict[str, Any]]:
     base_specs: List[Dict[str, Any]] = []
 
     # --- Ordering codes ---
-    ordering_codes = re.findall(r"(\d{2}\s\d{4}\s\d{2}\s\d{2})", text)
+    # Ordering codes like "99 0429 43 04" or "9904294304" with optional spaces
+    ordering_codes = re.findall(r"(\d{2}\s?\d{4}\s?\d{2}\s?\d{2})", text)
+    if not ordering_codes:
+        ordering_codes = re.findall(r"(\d{2}[-\s]?\d{4}[-\s]?\d{2}[-\s]?\d{2})", text)
+
 
     # --- IP rating ---
     ip_m = _rx_first(r"(IP\s*6[7-9]K?)", text)
@@ -264,6 +268,164 @@ def _parse_m12_catalog(pdf_path: str, text: str) -> List[Dict[str, Any]]:
 
     return products
 
+# =====================================================
+#            TECHNICAL INFORMATION PARSING
+# =====================================================
+
+def _looks_like_technical_info_pdf(text: str) -> bool:
+    """
+    Detects the general technical information PDF (often contains German headers
+    like 'Technische Informationen' or 'Allgemeine Hinweise').
+    """
+    t = text.lower()
+    hints = ["technische", "informationen", "hinweise", "querschnitt", "awg"]
+    return any(h in t for h in hints)
+
+
+def _parse_technical_info_pdf(pdf_path: str, text: str) -> List[Dict[str, Any]]:
+    """
+    Parse the 'Technische Informationen' PDF to extract generic reference data.
+    These rows are stored as 'Reference Data' products for lookup use.
+    """
+    products: List[Dict[str, Any]] = []
+    specs: List[Dict[str, Any]] = []
+
+    # --- AWG↔mm² table extraction ---
+    # Pattern like: "AWG 24 = 0,205 mm²"
+    for m in re.finditer(r"AWG\s*(\d{1,2})\s*=\s*([0-9]+[.,]?[0-9]*)\s*mm", text, flags=re.I):
+        awg_num = int(m.group(1))
+        mm2 = float(m.group(2).replace(",", "."))
+        specs.append({
+            "spec_key": f"awg_{awg_num}_mm2",
+            "spec_value_num": mm2,
+            "unit": "mm2",
+            "raw": m.group(0)
+        })
+
+    # --- Material / Temperature info ---
+    # Example: "PVC: -25 °C ... +70 °C"
+    for m in re.finditer(r"(PVC|PUR|TPE)[^°\n]*?([-+]?\d{1,3}).*?([-+]?\d{1,3})\s*°C", text, flags=re.I):
+        mat = m.group(1).upper()
+        tmin, tmax = int(m.group(2)), int(m.group(3))
+        specs.append({
+            "spec_key": f"{mat.lower()}_temp_min_c",
+            "spec_value_num": tmin,
+            "unit": "°C",
+            "raw": m.group(0)
+        })
+        specs.append({
+            "spec_key": f"{mat.lower()}_temp_max_c",
+            "spec_value_num": tmax,
+            "unit": "°C",
+            "raw": m.group(0)
+        })
+
+    # --- Voltage info (generic insulation ratings) ---
+    # Example: "Spannung bis 250 V" or "up to 250 V"
+    for m in re.finditer(r"(?:bis|up to)\s*([0-9]{2,4})\s*V", text, flags=re.I):
+        specs.append({
+            "spec_key": "reference_voltage_v",
+            "spec_value_num": float(m.group(1)),
+            "unit": "V",
+            "raw": m.group(0)
+        })
+
+    # Only add one "Reference Data" product, bundling all specs
+    if not specs:
+        return [{
+            "brand": None,
+            "family": "Reference Data",
+            "model_no": None,
+            "article_number": None,
+            "ordering_code": None,
+            "product_name": "General Technical Information (empty)",
+            "description": "No reference specs were parsed from this document",
+            "interfaces": None,
+            "source_pdf": os.path.basename(pdf_path),
+            "pages_covered": [1, 2, 3, 4, 5, 6],
+            "provenance": {"strategy": "technical_info_regex", "notes": ["no matches found"]},
+            "specs": [],
+        }]
+
+    return [{
+        "brand": None,
+        "family": "Reference Data",
+        "model_no": None,
+        "article_number": None,
+        "ordering_code": None,
+        "product_name": "General Technical Information",
+        "description": "Extracted normalization reference values",
+        "interfaces": None,
+        "source_pdf": os.path.basename(pdf_path),
+        "pages_covered": [1, 2, 3, 4, 5, 6],
+        "provenance": {"strategy": "technical_info_regex", "notes": ["reference lookup data"]},
+        "specs": specs,
+    }]
+
+# =====================================================
+#                LOOKS LIKE ALT
+# =====================================================
+
+
+def _keyword_score(text: str, positives: list[str], negatives: list[str] | None = None) -> int:
+    """
+    Returns a simple integer score: +1 per positive keyword present, -1 per negative.
+    Case-insensitive, substring match.
+    """
+    t = text.lower()
+    score = 0
+    for k in positives:
+        if k.lower() in t:
+            score += 1
+    if negatives:
+        for k in negatives:
+            if k.lower() in t:
+                score -= 1
+    return score
+
+
+def _classify_pdf(text: str) -> str:
+    """
+    Decide between 'binder', 'm12', 'techinfo', or 'unknown' using keyword scores.
+    Highest score wins; ties broken by a priority order (binder > m12 > techinfo).
+    """
+    # Binder cues
+    s_binder = _keyword_score(
+        text,
+        positives=["binder", "cb-s", "co2", "co₂", "incubator", "model cb-s"],
+        negatives=[]
+    )
+
+    # M12 catalog cues (German/English)
+    s_m12 = _keyword_score(
+        text,
+        positives=[
+            "m12", "sensorik", "aktorik",
+            "serie 713", "serie 763",
+            "bestell", "ordering code", "steckverbinder", "kabelstecker"
+        ],
+        negatives=["technische information", "technische informationen", "allgemeine hinweise"]
+    )
+
+    # Technical info cues (make this strict so it doesn’t swallow M12)
+    s_ti = _keyword_score(
+        text,
+        positives=["technische information", "technische informationen", "allgemeine hinweise", "awg"],
+        negatives=["serie 713", "serie 763", "m12", "ordering code", "bestell"]
+    )
+
+    scores = {
+        "binder": s_binder,
+        "m12": s_m12,
+        "techinfo": s_ti,
+        "unknown": 0
+    }
+
+    # pick highest; deterministic tie-break (binder > m12 > techinfo > unknown)
+    ordered = sorted(scores.items(), key=lambda kv: (kv[1], kv[0] in ["binder", "m12", "techinfo"]), reverse=True)
+    top, top_score = ordered[0]
+    return top if top_score > 0 else "unknown"
+
 
 # =====================================================
 #                MAIN PUBLIC ENTRYPOINT
@@ -284,17 +446,17 @@ def extract_products(pdf_dir: str) -> List[Dict[str, Any]]:
             continue
 
         path = os.path.join(pdf_dir, name)
-        text = _read_text_sample(path, pages=6)
+        # read more pages to improve classification on large catalogs
+        text = _read_text_sample(path, pages=12)
 
-        # --- Binder sheet detection ---
-        if text and _looks_like_binder_sheet(text):
+        doc_type = _classify_pdf(text) if text else "unknown"
+
+        if doc_type == "binder":
             products.extend(_parse_binder_cb_s_260(path, text))
-
-        # --- M12 catalog detection ---
-        elif text and _looks_like_m12_catalog(text):
+        elif doc_type == "m12":
             products.extend(_parse_m12_catalog(path, text))
-
-        # --- Fallback (placeholder) ---
+        elif doc_type == "techinfo":
+            products.extend(_parse_technical_info_pdf(path, text))
         else:
             products.append({
                 "brand": None,
@@ -311,4 +473,6 @@ def extract_products(pdf_dir: str) -> List[Dict[str, Any]]:
                 "specs": [],
             })
 
+
     return products
+

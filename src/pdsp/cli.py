@@ -6,12 +6,9 @@ from rich.console import Console
 from rich.table import Table
 
 from pdsp.db import (
-    get_connection,
-    ensure_schema,
-    insert_products,
-    query_by_model,
-    query_by_brand,
-    query_by_spec,
+    get_connection, ensure_schema, insert_products,
+    query_by_model, query_by_brand, query_by_spec,
+    query_specs_for_code, audit_spec_coverage, query_by_spec_text,
 )
 from pdsp.extract import extract_products
 
@@ -50,6 +47,42 @@ def process(
         console.print(f"[bold cyan]Export[/bold cyan] → {jsonl}")
 
 
+@app.command(help="Inspect all specs for a given ordering code or model")
+def inspect(
+    code: str = typer.Option(..., "--code", "-c", help="ordering_code or model_no"),
+    db: str = typer.Option("products.sqlite", "--db"),
+):
+    conn = get_connection(db)
+    rows = query_specs_for_code(conn, code)
+    if not rows:
+        console.print("[yellow]No specs found for this code.[/yellow]")
+        raise typer.Exit(code=0)
+
+    t = Table(title=f"Specs for {code}")
+    t.add_column("product_id"); t.add_column("spec_key"); t.add_column("spec_value_num"); t.add_column("spec_value_text"); t.add_column("unit"); t.add_column("raw")
+    for r in rows:
+        t.add_row(str(r["product_id"]), r["spec_key"], str(r["spec_value_num"]), str(r["spec_value_text"]), str(r.get("unit") or ""), str(r.get("raw") or ""))
+    console.print(t)
+
+
+@app.command(help="Report coverage per spec_key (how many rows; how many numeric)")
+def audit(
+    db: str = typer.Option("products.sqlite", "--db"),
+):
+    conn = get_connection(db)
+    rows = audit_spec_coverage(conn)
+    if not rows:
+        console.print("[yellow]No specs in database.[/yellow]")
+        raise typer.Exit(code=0)
+
+    t = Table(title="Spec coverage")
+    for col in ["spec_key", "total_rows", "numeric_rows"]:
+        t.add_column(col)
+    for r in rows:
+        t.add_row(r["spec_key"], str(r["total_rows"]), str(r["numeric_rows"]))
+    console.print(t)
+
+
 @query_app.command("by-model")
 def by_model(
     db: str = typer.Option("products.sqlite", "--db"),
@@ -80,6 +113,18 @@ def by_spec(
 ):
     conn = get_connection(db)
     rows = query_by_spec(conn, key, op, value)
+    _print_products_with_spec(rows)
+
+
+@query_app.command("by-spec-text")
+def by_spec_text(
+    db: str = typer.Option("products.sqlite", "--db"),
+    key: str = typer.Option(..., "--key"),
+    contains: Optional[str] = typer.Option(None, "--contains", help="substring match"),
+    equals: Optional[str] = typer.Option(None, "--equals", help="case-insensitive exact"),
+):
+    conn = get_connection(db)
+    rows = query_by_spec_text(conn, key, contains=contains, equals=equals)
     _print_products_with_spec(rows)
 
 

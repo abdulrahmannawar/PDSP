@@ -197,3 +197,69 @@ def query_by_spec(
     """
     rows = conn.execute(sql, [key, value]).fetchall()
     return rows
+
+from typing import List, Dict, Any, Optional
+import sqlite3
+
+# ... keep existing imports and functions ...
+
+
+def query_specs_for_code(conn: sqlite3.Connection, code: str) -> List[Dict[str, Any]]:
+    """
+    Return all specs for the product whose ordering_code == code
+    (or model_no == code as fallback).
+    """
+    sql = """
+    SELECT s.product_id, s.spec_key, s.spec_value_num, s.spec_value_text, s.unit, s.raw
+    FROM specs s
+    JOIN products p ON p.id = s.product_id
+    WHERE (p.ordering_code = ? OR p.model_no = ?)
+    ORDER BY s.spec_key
+    """
+    cur = conn.execute(sql, (code, code))
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def audit_spec_coverage(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """
+    Count how many rows each spec_key appears on, and how many are numeric.
+    """
+    sql = """
+    SELECT
+      spec_key,
+      COUNT(*) AS total_rows,
+      SUM(CASE WHEN spec_value_num IS NOT NULL THEN 1 ELSE 0 END) AS numeric_rows
+    FROM specs
+    GROUP BY spec_key
+    ORDER BY total_rows DESC, spec_key ASC
+    """
+    cur = conn.execute(sql)
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def query_by_spec_text(conn: sqlite3.Connection, key: str, contains: Optional[str] = None, equals: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Text-based spec filter. Either 'contains' (ILIKE) or 'equals' (case-insensitive exact).
+    """
+    if contains:
+        sql = """
+        SELECT p.*, s.spec_key, s.spec_value_text, s.unit
+        FROM products p
+        JOIN specs s ON s.product_id = p.id
+        WHERE s.spec_key = ? AND s.spec_value_text LIKE ?
+        """
+        cur = conn.execute(sql, (key, f"%{contains}%"))
+    elif equals:
+        sql = """
+        SELECT p.*, s.spec_key, s.spec_value_text, s.unit
+        FROM products p
+        JOIN specs s ON s.product_id = p.id
+        WHERE s.spec_key = ? AND LOWER(s.spec_value_text) = LOWER(?)
+        """
+        cur = conn.execute(sql, (key, equals))
+    else:
+        return []
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]

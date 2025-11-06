@@ -267,10 +267,10 @@ def _nearest_series(text: str, idx: int, window: int = 400) -> Optional[str]:
     return choices[0][0]
 
 
-def _extract_nearby_kv(text: str, idx: int, window: int = 300) -> Dict[str, Any]:
+def _extract_nearby_kv(text: str, idx: int, window: int = 1500) -> Dict[str, Any]:
     """
-    Scrape a neighborhood around the match (±window) for:
-    contacts (Polzahl), IP rating, temps, rated voltage, wire gauge.
+    Scrape a neighborhood around an ordering code (±window) for many specs.
+    Targets the 'Technische Daten Kabel / Specifications of cable' block.
     """
     start = max(0, idx - window)
     end = min(len(text), idx + window)
@@ -278,30 +278,42 @@ def _extract_nearby_kv(text: str, idx: int, window: int = 300) -> Dict[str, Any]
 
     out: Dict[str, Any] = {}
 
-    # contacts / Polzahl
+    # ---------------------------
+    # CORE FIELDS
+    # ---------------------------
+
+    # contacts (Polzahl)
     m_contacts = re.search(r"\b(?:Polzahl|Contacts)\b[^\n]*?(\d{1,2})", seg, flags=re.I)
     if m_contacts:
         out["contacts"] = int(m_contacts.group(1))
 
-    # ip rating (collect distinct)
+    # cable length (left table under 'Kabellänge / Cable length') -> values like '2 m', '5 m'
+    # we keep the largest nearby length as headline (variants often list multiple)
+    lens = re.findall(r"\b(\d{1,2})\s*m\b", seg)
+    if lens:
+        out["cable_length_m"] = float(max(int(x) for x in lens))
+
+    # article number blocks like: 77 3420 0000 50003–0200 (we capture the 77 3420 ... root)
+    # note: dash variants: -, –, — ; we keep the left part as article number "root"
+    m_art = re.search(r"\b(77\s?\d{4}\s?\d{4}\s?\d{5})\s*[-–—]\s*\d{4}\b", seg)
+    if not m_art:
+        # sometimes shorter middle blocks
+        m_art = re.search(r"\b(77\s?\d{4}\s?\d{4}\s?\d{4,5})\b", seg)
+    if m_art:
+        # normalize spaces
+        out["article_number"] = " ".join(re.findall(r"\d{2,5}", m_art.group(1)))
+
+    # IP ratings (collect distinct)
     ips = re.findall(r"\bIP6[7-9]K?\b", seg)
     if ips:
         out["ip_rating"] = ",".join(sorted(set(ips)))
 
-    # temperatures (upper/lower limit)
-    up = re.search(r"(?:Obere\s+Grenztemperatur|Upper\s+temperature)[^\n]*?([-+]?\d{1,3})\s*°C", seg, flags=re.I)
-    lo = re.search(r"(?:Untere\s+Grenztemperatur|Lower\s+temperature)[^\n]*?([-+]?\d{1,3})\s*°C", seg, flags=re.I)
-    if up:
-        out["temp_max_c"] = float(up.group(1))
-    if lo:
-        out["temp_min_c"] = float(lo.group(1))
-
-    # rated voltage (keep max as conservative headline)
+    # rated voltage (take max seen nearby)
     volts = re.findall(r"(\d{2,4})\s*V\b", seg)
     if volts:
         out["rated_voltage_v"] = float(max(int(v) for v in volts))
 
-    # wire gauge mm² (normalized helper)
+    # AWG/mm² to wire_gauge_mm2 (preserve text if conversion fails)
     wg = re.search(r"(AWG\s*\d{1,2}|\d+(?:[.,]\d+)?\s*mm(?:2|²))", seg, flags=re.I)
     if wg:
         val, unit, raw = normalize_awg_or_mm2(wg.group(1))
@@ -309,6 +321,71 @@ def _extract_nearby_kv(text: str, idx: int, window: int = 300) -> Dict[str, Any]
             out["wire_gauge_mm2"] = val
         else:
             out["wire_gauge_text"] = raw
+
+    # ---------------------------
+    # CABLE DATA TABLE (BILINGUAL)
+    # ---------------------------
+
+    # material jacket (PUR/PVC/TPE)
+    m_jacket = re.search(r"(?:Material\s*Mantel|Material\s*jacket)\s*[:\s]\s*(PUR|PVC|TPE)", seg, flags=re.I)
+    if m_jacket:
+        out["material_jacket"] = m_jacket.group(1).upper()
+
+    # insulation of wire (PP/PE/PVC etc.)
+    m_ins = re.search(r"(?:Isolation\s*Litze|Insulation\s*wire)\s*[:\s]\s*([A-Za-z0-9/ \-]+)", seg, flags=re.I)
+    if m_ins:
+        out["insulation_wire"] = m_ins.group(1).strip()
+
+    # design of wire (e.g., '42 x 0,1')
+    m_design = re.search(r"(?:Litzenaufbau|Design\s*of\s*wire)\s*[:\s]\s*([0-9xX ,\.]+)", seg, flags=re.I)
+    if m_design:
+        out["design_of_wire"] = m_design.group(1).replace(" ", "")
+
+    # cable Ø (mm)
+    m_diam = re.search(r"(?:Kabelmantel\s*Ø|Cable\s*jacket\s*Ø)\s*[:\s]\s*([0-9]+[.,]?[0-9]?)\s*mm", seg, flags=re.I)
+    if m_diam:
+        out["cable_diameter_mm"] = float(m_diam.group(1).replace(",", "."))
+
+    # resistance of wire: '60 Ω/km (20 °C)' or '79.0 Ω/km (20 °C)'
+    m_res = re.search(r"(?:Leiterwiderstand|Resistance\s*of\s*wire)\s*[:\s]\s*([0-9]+[.,]?\d*)\s*Ω/km", seg, flags=re.I)
+    if m_res:
+        out["resistance_ohm_per_km_20c"] = float(m_res.group(1).replace(",", "."))
+
+    # temperature ranges (cable in move / fixed)
+    m_t_move = re.search(r"(?:Temperaturbereich\s*\(Kabel\s*bewegt\)|Temperature\s*range\s*\(cable\s*in\s*move\))[^-+]*([\-+]\d{1,3}).*?([\-+]\d{1,3})\s*°C", seg, flags=re.I)
+    if m_t_move:
+        out["temp_min_c"] = float(m_t_move.group(1))
+        out["temp_max_c"] = float(m_t_move.group(2))
+    else:
+        # fallback: generic range on the page block
+        span = re.search(r"([\-+]\d{1,3}).*?([\-+]\d{1,3})\s*°C", seg, flags=re.I | re.S)
+        if span:
+            lo, hi = int(span.group(1)), int(span.group(2))
+            # assign conservatively if not already set
+            out.setdefault("temp_min_c", float(min(lo, hi)))
+            out.setdefault("temp_max_c", float(max(lo, hi)))
+
+    # bending radius (move/fixed) given in D multiples: 'min. 10 x D' or 'min. 5 x D'
+    m_br_move = re.search(r"(?:Biegeradius\s*\(Kabel\s*bewegt\)|Bending\s*radius\s*\(cable\s*in\s*move\))[^0-9]*([0-9]+)\s*x\s*D", seg, flags=re.I)
+    if m_br_move:
+        out["bending_radius_move_d"] = float(m_br_move.group(1))
+
+    m_br_fixed = re.search(r"(?:Biegeradius\s*\(Kabel\s*fest\)|Bending\s*radius\s*\(static\s*cable\))[^0-9]*([0-9]+)\s*x\s*D", seg, flags=re.I)
+    if m_br_fixed:
+        out["bending_radius_fixed_d"] = float(m_br_fixed.group(1))
+
+    # bending cycles (e.g., '5 Mio.' or '2 Mio.')
+    m_cycles = re.search(r"(?:Biegezyklen|Bending\s*cycles)[^\d]*([0-9]+)\s*Mio", seg, flags=re.I)
+    if m_cycles:
+        out["bending_cycles_mio"] = float(m_cycles.group(1))
+
+    # speed (m/s), acceleration (m/s²)
+    m_speed = re.search(r"(?:Verfahrweg\s*horizontal\s*bis|Traverse\s*path\s*horizontal\s*up\s*to)\s*([0-9]+(?:[.,]\d+)?)\s*m/s", seg, flags=re.I)
+    if m_speed:
+        out["speed_ms"] = float(m_speed.group(1).replace(",", "."))
+    m_acc = re.search(r"(?:Zulässige\s*Beschleunigung|Permitted\s*acceleration)\s*([0-9]+(?:[.,]\d+)?)\s*m/s²?", seg, flags=re.I)
+    if m_acc:
+        out["acceleration_ms2"] = float(m_acc.group(1).replace(",", "."))
 
     return out
 
@@ -346,18 +423,38 @@ def _parse_m12_catalog(pdf_path: str, text: str) -> List[Dict[str, Any]]:
         family = series if series else "713 · 763"  # default combined if unknown
 
         nearby = _extract_nearby_kv(text, m.start())
+        # after: nearby = _extract_nearby_kv(text, m.start())
         specs: List[Dict[str, Any]] = []
 
-        # fold nearby fields into specs
-        for k in ["contacts", "rated_voltage_v", "temp_min_c", "temp_max_c", "wire_gauge_mm2", "wire_gauge_text", "ip_rating"]:
+        for k in [
+            "contacts",
+            "cable_length_m",
+            "article_number",
+            "material_jacket",
+            "insulation_wire",
+            "design_of_wire",
+            "cable_diameter_mm",
+            "resistance_ohm_per_km_20c",
+            "temp_min_c",
+            "temp_max_c",
+            "bending_radius_move_d",
+            "bending_radius_fixed_d",
+            "bending_cycles_mio",
+            "speed_ms",
+            "acceleration_ms2",
+            "rated_voltage_v",
+            "wire_gauge_mm2",
+            "wire_gauge_text",
+            "ip_rating",
+        ]:
             if k in nearby:
                 v = nearby[k]
                 if isinstance(v, (int, float)):
                     specs.append({"spec_key": k, "spec_value_num": float(v), "raw": str(v)})
                 else:
                     specs.append({"spec_key": k, "spec_value_text": str(v), "raw": str(v)})
-                    
-        # add coding info as a spec (so 'family' stays clean)
+
+        # keep coding
         specs.append({"spec_key": "coding", "spec_value_text": "M12 A", "raw": "M12 A"})
 
         products.append({

@@ -18,14 +18,19 @@ if DISABLE_CAMELOT:
     camelot = None
 
 from pdsp.normalize import (
-    to_snake_case,
-    canonical_key,
+    parse_mating_cycles,
+    english_tail,
+    extract_row_by_english_label,
+    parse_rated_voltage_pair,
+    parse_rated_impulse_voltage_pair,
+    parse_rated_current_pair,
     normalize_awg_or_mm2,
     parse_mm_range,        # NEW
     parse_ip_code,         # NEW
     parse_temp_block,      # NEW
     parse_voltage_block,   # NEW
     parse_current_block,   # NEW
+    build_contact_value_map,
 )
 
 # ----------------------------------------------------
@@ -171,7 +176,17 @@ def _parse_m12_binder_713_763(pdf_path: str) -> List[Dict[str, Any]]:
 
         page_desc = _extract_variant_description(page_text)
         small_table_rows = _extract_small_tables(page_text, pdf_path, idx)
-        shared_specs = _extract_shared_specs(page_text)
+        
+        if not small_table_rows:
+            continue
+        
+                # collect unique contact counts present on this page
+        page_contacts = sorted(
+            {r.get("contacts") for r in small_table_rows if r.get("contacts") is not None}
+        )
+
+        # build spec map: {contact_count: {spec_key: english_value}}
+        contact_spec_map = build_contact_value_map(page_text, page_contacts)
 
         for row in small_table_rows:
             contacts = row.get("contacts")
@@ -193,7 +208,40 @@ def _parse_m12_binder_713_763(pdf_path: str) -> List[Dict[str, Any]]:
                 specs.append({"spec_key": "contacts", "spec_value_num": float(contacts), "raw": str(contacts)})
 
             # merge shared specs
-            specs.extend(shared_specs)
+                        # page-level ip / temp (safe to add per row)
+            ip = parse_ip_code(page_text)
+            if ip:
+                specs.append({"spec_key": "ip_rating", "spec_value_text": ip, "raw": ip})
+
+            tmin, tmax = parse_temp_block(page_text)
+            if tmax is not None:
+                specs.append({"spec_key": "temp_max_c", "spec_value_num": tmax, "unit": "°C", "raw": str(tmax)})
+            if tmin is not None:
+                specs.append({"spec_key": "temp_min_c", "spec_value_num": tmin, "unit": "°C", "raw": str(tmin)})
+
+            # contact-specific specs from big table
+            if contact_spec_map:
+                contact_specs = contact_spec_map.get(contacts, contact_spec_map.get(0, {}))
+                for k, v in contact_specs.items():
+                    if not v:
+                        continue
+                    specs.append({
+                        "spec_key": k,
+                        "spec_value_text": v,
+                        "raw": v,
+                    })
+
+            # dedupe specs
+            seen = set()
+            unique_specs = []
+            for s in specs:
+                sig = (s["spec_key"], s.get("spec_value_text"), s.get("spec_value_num"))
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                unique_specs.append(s)
+            specs = unique_specs
+
 
             out.append({
                 "brand": "Binder",
@@ -265,28 +313,108 @@ def _extract_small_tables(page_text: str, pdf_path: str, page_index: int) -> Lis
 
     # Fallback (or supplement): regex extraction from text block
     # 1) chunk by occurrence of the headers
+        # Fallback (or supplement): line-based parser for side-by-side small tables
+        # Fallback (text-only): parse side-by-side small tables using local windows
     if not rows:
-        block_pat = re.compile(
-            r"(?P<head>(?:Polzahl|Contacts).{0,120}?(?:Bestell|Ordering)[^\n]*)(?P<body>.+?)(?:\n\n|\Z)",
-            flags=re.I | re.S
-        )
-        for m in block_pat.finditer(page_text):
-            body = m.group("body")
-            # rows look like:
-            #   4
-            #   4–6 mm  99 0429 14 04
-            #   6–8 mm  99 0429 12 04
-            # or inline variants
-            # Grab a leading contacts number, then many (outlet, code) pairs
-            contacts_head = re.search(r"\b(\d{1,2})\b", body)
-            contacts = int(contacts_head.group(1)) if contacts_head else None
+        lines = page_text.splitlines()
 
-            for mm, code in re.findall(r"([0-9,.\-–]+ ?mm)\s+((?:9\d)(?:\s?\d{2,4}){3,4})", body, flags=re.I):
-                rows.append({
-                    "contacts": contacts,
-                    "cable_outlet": mm.replace("–", "-").strip(),
-                    "ordering_code": _extract_ordering_code(code)
-                })
+        # find bounds: after header, before spec block
+        start = None
+        end = None
+        for i, ln in enumerate(lines):
+            if "Contacts Cable outlet Ordering-No." in ln:
+                start = i + 1
+            if start is not None and (
+                "schrauben/screw" in ln
+                or "Connector locking system" in ln
+            ):
+                end = i
+                break
+
+        if start is not None and end is not None and end > start:
+            last_nums: list[int] | None = None
+            i = start
+
+            while i < end:
+                ln = lines[i].strip()
+                if not ln:
+                    i += 1
+                    continue
+
+                # mm + ordering-code pairs on this line (left & right table)
+                pairs = re.findall(
+                    r"([0-9,.\-–]+ ?mm)\s+((?:9\d)(?:\s?\d{2,4}){3,4})",
+                    ln,
+                )
+
+                # digits-only line like "4 4" or "5 5" or "4 5"
+                if not pairs and re.fullmatch(r"(?:\d+\s+)+\d+", ln):
+                    nums = [int(x) for x in ln.split()]
+                    last_nums = nums  # used for following mm-lines
+                    i += 1
+                    continue
+
+                if pairs:
+                    # look ahead: if next line is digits, use that for THIS line
+                    nums: list[int] | None = None
+                    if i + 1 < end:
+                        nxt = lines[i + 1].strip()
+                        if re.fullmatch(r"(?:\d+\s+)+\d+", nxt):
+                            nums = [int(x) for x in nxt.split()]
+
+                    # helper: add one row
+                    def add_row(mm: str, code: str, contact: int | None):
+                        rows.append(
+                            {
+                                "contacts": contact,
+                                "cable_outlet": mm.replace("–", "-").strip(),
+                                "ordering_code": _extract_ordering_code(code),
+                            }
+                        )
+
+                    k = len(pairs)
+
+                    if nums:
+                        # exact match: one contact per pair
+                        if len(nums) == k:
+                            for (mm, code), c in zip(pairs, nums):
+                                add_row(mm, code, c)
+                        # single contact -> all pairs
+                        elif len(nums) == 1:
+                            c = nums[0]
+                            for mm, code in pairs:
+                                add_row(mm, code, c)
+                        else:
+                            # fallback: assign first number to all pairs
+                            c = nums[0]
+                            for mm, code in pairs:
+                                add_row(mm, code, c)
+                        last_nums = nums
+                        i += 2  # consumed next line as digits
+                        continue
+
+                    # no inline digits: use last_nums if sensible
+                    if last_nums:
+                        if len(last_nums) == k:
+                            for (mm, code), c in zip(pairs, last_nums):
+                                add_row(mm, code, c)
+                        elif len(last_nums) == 1:
+                            c = last_nums[0]
+                            for mm, code in pairs:
+                                add_row(mm, code, c)
+                        else:
+                            for mm, code in pairs:
+                                add_row(mm, code, None)
+                    else:
+                        for mm, code in pairs:
+                            add_row(mm, code, None)
+
+                    i += 1
+                    continue
+
+                i += 1
+
+
 
     # de-dup
     seen = set()
@@ -323,27 +451,3 @@ def _coerce_int(s: str) -> Optional[int]:
         return int(re.findall(r"\d+", s)[0])
     except Exception:
         return None
-
-def _extract_shared_specs(page_text: str) -> List[Dict[str, Any]]:
-    """
-    Parse the large property list that applies to all rows on the page.
-    We pick stable items: IP rating, temp min/max, voltage(s), rated current(s).
-    """
-    specs: List[Dict[str, Any]] = []
-
-    ip = parse_ip_code(page_text)
-    if ip:
-        specs.append({"spec_key": "ip_rating", "spec_value_text": ip, "raw": ip})
-
-    tmin, tmax = parse_temp_block(page_text)
-    if tmin is not None:
-        specs.append({"spec_key": "temp_min_c", "spec_value_num": tmin, "unit": "°C", "raw": str(tmin)})
-    if tmax is not None:
-        specs.append({"spec_key": "temp_max_c", "spec_value_num": tmax, "unit": "°C", "raw": str(tmax)})
-
-    for v in parse_voltage_block(page_text):
-        specs.append(v)
-    for a in parse_current_block(page_text):
-        specs.append(a)
-
-    return specs

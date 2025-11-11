@@ -74,6 +74,7 @@ Behavior:
   - M12 Technical Information (M12 coding overview)
 - Outputs the normalized data into the given SQLite DB and JSONL file.
 
+_NOTE: It is advised to use a smaller sample size on the M12 pdf, as it is large and will slow down process time significantly._
 _NOTE: Rerunning this command will not overwrite the previous tables if the same file names are given._
 
 ---

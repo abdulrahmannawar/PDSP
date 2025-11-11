@@ -81,7 +81,64 @@ def audit(
     for r in rows:
         t.add_row(r["spec_key"], str(r["total_rows"]), str(r["numeric_rows"]))
     console.print(t)
+    
 
+@app.command(help="List distinct spec keys, optionally filtered by product.")
+def keys(
+    db: str = typer.Option("products.sqlite", "--db"),
+    brand: str = typer.Option(None, "--brand", help="Filter by brand"),
+    family: str = typer.Option(None, "--family", help="Filter by family"),
+    code: str = typer.Option(
+        None,
+        "--code",
+        "-c",
+        help="Filter by ordering_code or model_no (e.g. 99 0429 07 04 or CBS260-230V)",
+    ),
+):
+    conn = get_connection(db)
+
+    where_clauses = []
+    params: list[str] = []
+
+    if brand:
+        where_clauses.append("p.brand = ?")
+        params.append(brand)
+
+    if family:
+        where_clauses.append("p.family = ?")
+        params.append(family)
+
+    if code:
+        where_clauses.append("(p.ordering_code = ? OR p.model_no = ?)")
+        params.extend([code, code])
+
+    where_sql = ""
+    if where_clauses:
+        where_sql = "WHERE " + " AND ".join(where_clauses)
+
+    sql = f"""
+        SELECT DISTINCT s.spec_key
+        FROM specs s
+        JOIN products p ON p.id = s.product_id
+        {where_sql}
+        ORDER BY s.spec_key
+    """
+
+    cur = conn.execute(sql, params)
+    rows = cur.fetchall()
+
+    if not rows:
+        console.print("[yellow]No spec keys found for this filter.[/yellow]")
+        raise typer.Exit(code=0)
+
+    table = Table(title="spec_key values")
+    table.add_column("spec_key")
+
+    for (spec_key,) in rows:
+        table.add_row(spec_key or "")
+
+    console.print(table)
+    
 
 @query_app.command("by-model")
 def by_model(
@@ -159,21 +216,39 @@ def _print_products_with_spec(rows: Iterable):
         return
 
     t = Table(title="Products (spec filter)", show_lines=False)
-    for col in ["id", "brand", "family", "model_no", "ordering_code", "product_name", "spec_key", "spec_value_num", "spec_value_text", "unit", "source_pdf"]:
+    for col in [
+        "id",
+        "brand",
+        "family",
+        "model_no",
+        "ordering_code",
+        "product_name",
+        "spec_key",
+        "spec_value_num",
+        "spec_value_text",
+        "unit",
+        "source_pdf",
+    ]:
         t.add_column(col)
 
-    for r in rows:
+    for row in rows:
+        r = dict(row) 
+
+        spec_value_num = r.get("spec_value_num")
+        spec_value_text = r.get("spec_value_text")
+
         t.add_row(
-            str(r["id"]),
-            str(r["brand"]),
-            str(r["family"]),
-            str(r["model_no"]),
-            str(r["ordering_code"]),
-            str(r["product_name"]),
-            str(r["spec_key"]),
-            str(r["spec_value_num"]),
-            str(r["spec_value_text"]),
-            str(r["unit"]),
-            str(r["source_pdf"]),
+            str(r.get("id", "")),
+            str(r.get("brand", "")),
+            str(r.get("family", "")),
+            str(r.get("model_no", "")),
+            str(r.get("ordering_code", "")),
+            str(r.get("product_name", "")),
+            str(r.get("spec_key", "")),
+            "" if spec_value_num is None else str(spec_value_num),
+            "" if spec_value_text is None else str(spec_value_text),
+            str(r.get("unit", "") or ""),
+            str(r.get("source_pdf", "") or ""),
         )
+
     console.print(t)

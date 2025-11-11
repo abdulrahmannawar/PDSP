@@ -1,7 +1,6 @@
 from __future__ import annotations
 import re
 from typing import Tuple, Optional, List, Dict
-import itertools
 
 def to_snake_case(s: str) -> str:
     s = s.strip()
@@ -14,26 +13,6 @@ def to_snake_case(s: str) -> str:
     s = s.replace(" ", "_")
     return s
 
-def canonical_key(s: str) -> str:
-    return to_snake_case(s)
-
-def normalize_awg_or_mm2(raw: str) -> Tuple[Optional[float], Optional[str], str]:
-    text = (raw or "").strip()
-    m_mm2 = re.search(r"([0-9]+(?:[.,][0-9]+)?)\s*mm(?:2|²)\b", text, flags=re.I)
-    if m_mm2:
-        val = float(m_mm2.group(1).replace(",", "."))
-        return val, "mm2", raw
-
-    awg_map = {24: 0.205, 23: 0.258, 22: 0.326, 21: 0.410, 20: 0.519, 19: 0.653, 18: 0.823}
-    m_awg = re.search(r"\bawg\s*([0-9]{1,2})\b", text, flags=re.I)
-    if m_awg:
-        n = int(m_awg.group(1))
-        if n in awg_map:
-            return float(awg_map[n]), "mm2_est", raw
-        return None, "awg", raw
-    return None, None, raw
-
-# -------- NEW helpers below --------
 
 def parse_mm_range(text: Optional[str]) -> Tuple[Optional[float], Optional[float]]:
     """
@@ -49,9 +28,11 @@ def parse_mm_range(text: Optional[str]) -> Tuple[Optional[float], Optional[float
     hi = float(m.group(2).replace(",", "."))
     return lo, hi
 
+
 def parse_ip_code(page_text: str) -> Optional[str]:
     m = re.search(r"\bIP\d{2}(?:[A-ZK])?(?:,\s*Outdoor\s*IP\d{2}[A-ZK]?)?", page_text, flags=re.I)
     return m.group(0).replace(" ", "") if m else None
+
 
 def parse_temp_block(page_text: str) -> Tuple[Optional[float], Optional[float]]:
     """
@@ -69,26 +50,7 @@ def parse_temp_block(page_text: str) -> Tuple[Optional[float], Optional[float]]:
         tmin = float(re.sub(r"\s+", "", m_lo.group(1).replace("–", "-").replace("+", "")))
     return tmin, tmax
 
-def parse_voltage_block(page_text: str) -> List[Dict[str, object]]:
-    """
-    Capture common triplet '250 V / 60 V / 30 V' on these pages.
-    """
-    out: List[Dict[str, object]] = []
-    for m in re.finditer(r"\b(\d{2,4})\s*V\b", page_text):
-        out.append({"spec_key": "rated_voltage_v", "spec_value_num": float(m.group(1)), "unit": "V", "raw": m.group(0)})
-    return out[:3]  # keep it light; usually three values appear
 
-def parse_current_block(page_text: str) -> List[Dict[str, object]]:
-    """
-    Examples include lines like '4 A 2 A 1,5 A' or '8 A ... 2 A'.
-    """
-    out: List[Dict[str, object]] = []
-    amps = re.findall(r"(\d{1,2}(?:[.,]\d)?)\s*A\b", page_text)
-    for a in amps[:3]:
-        out.append({"spec_key": "rated_current_a", "spec_value_num": float(a.replace(",", ".")), "unit": "A", "raw": a + " A"})
-    return out
-
-# ADD near other helpers
 def english_tail(label: str) -> str:
     """
     Ensure we only keep the English part at the end of a combined 'DE EN' label.
@@ -101,49 +63,6 @@ def english_tail(label: str) -> str:
     if m:
         return m.group(2).strip()
     return label.strip()
-
-
-def extract_row_by_english_label(page_text: str, label_en: str) -> str | None:
-    # Find the line that ends with the English label and return the English value part
-    for line in page_text.splitlines():
-        if re.search(rf"(?i)\b{re.escape(label_en)}\b", line):
-            # drop the label itself, keep what's before, then take the English half
-            head = re.sub(rf"(?i)\b{re.escape(label_en)}\b", "", line).strip(" :\t")
-            head = re.sub(r"\s+", " ", head).strip()
-            return english_tail(head) or None
-    return None
-
-def _parse_contact_pair_line(page_text: str, de_label: str, en_label: str, unit_pat: str) -> tuple[str | None, str | None]:
-    # Expect a line with: <DE label> ... <val_for_4> ... <val_for_5> ... <EN label>
-    rx = rf"(?im)^{re.escape(de_label)}\s+(?P<c4>.+?)\s+(?P<c5>.+?)\s+{re.escape(en_label)}\s*$"
-    m = re.search(rx, page_text)
-    if not m:
-        return None, None
-    def pick(s: str) -> str | None:
-        u = re.search(unit_pat, s)
-        return u.group(0).strip() if u else None
-    return pick(m.group("c4")), pick(m.group("c5"))
-
-def parse_rated_voltage_pair(page_text: str) -> tuple[str | None, str | None]:
-    return _parse_contact_pair_line(page_text, "Bemessungsspannung", "Rated voltage", r"\d{2,4}\s*V")
-
-def parse_rated_impulse_voltage_pair(page_text: str) -> tuple[str | None, str | None]:
-    return _parse_contact_pair_line(page_text, "Bemessungs-Stoßspannung", "Rated impulse voltage", r"\d{3,5}\s*V")
-
-def parse_rated_current_pair(page_text: str) -> tuple[str | None, str | None]:
-    return _parse_contact_pair_line(page_text, "Bemessungsstrom \(40°C\)", "Rated current \(40 °C\)", r"\d{1,2}(?:[.,]\d)?\s*A")
-
-
-def parse_mating_cycles(page_text: str) -> Optional[int]:
-    m = re.search(r"(?i)(?:mechanische lebensdauer|mating cycles)[^\n>]*>\s*([0-9]{1,5})", page_text)
-    if m:
-        try:
-            return int(m.group(1))
-        except ValueError:
-            return None
-    return None
-
-
 
 def normalize_bilingual_value(val: str) -> str:
     val = val.strip()
@@ -171,105 +90,6 @@ def normalize_bilingual_value(val: str) -> str:
 
     return val
 
-
-
-
-
-
-
-
-
-
-
-# ADD: detect the contact columns order from the header line
-# REPLACE the old detect_contact_columns with this
-def detect_contact_columns(page_text: str) -> list[int]:
-    lines = page_text.splitlines()
-
-    # primary: look around "Number of contacts"
-    for idx, ln in enumerate(lines):
-        if re.search(r"(?i)\bnumber of contacts\b", ln):
-            window = " ".join(lines[max(0, idx - 4): idx + 2])
-            nums = re.findall(r"\b([1-9]|1[0-2])\b", window)
-            cols = [int(n) for n in nums if n.isdigit()]
-            cols = [c for c in cols if 2 <= c <= 16]
-            if cols:
-                seen, ordered = set(), []
-                for c in cols:
-                    if c not in seen:
-                        seen.add(c); ordered.append(c)
-                return ordered
-
-    # fallback: look forward after "Polzahl"
-    for idx, ln in enumerate(lines):
-        if re.search(r"(?i)\bpolzahl\b", ln):
-            window = " ".join(lines[idx: idx + 6])
-            nums = re.findall(r"\b([1-9]|1[0-2])\b", window)
-            cols = [int(n) for n in nums if n.isdigit()]
-            cols = [c for c in cols if 2 <= c <= 16]
-            if cols:
-                seen, ordered = set(), []
-                for c in cols:
-                    if c not in seen:
-                        seen.add(c); ordered.append(c)
-                return ordered
-
-    return []
-
-
-# ADD: split middle area into K cells using spacing heuristics
-def split_cells(middle: str, k: int) -> list[str]:
-    text = middle.replace("\u2009", " ").strip()
-
-    # try 3+ spaces as hard column gaps
-    parts = [p.strip() for p in re.split(r"\s{3,}", text) if p.strip()]
-    if k > 1 and len(parts) == k:
-        return parts
-
-    # try 2+ spaces
-    parts = [p.strip() for p in re.split(r"\s{2,}", text) if p.strip()]
-    if k > 1 and len(parts) == k:
-        return parts
-
-    # fallback: unit-aware bucketing (keeps numbers with their units)
-    tokens = re.findall(r"[^\s]+(?:\s?(?:V|A|mm|°C|K|PA|PEEK|IP[0-9A-Z]+))?", text)
-    if k > 1 and len(tokens) >= k:
-        buckets = [[] for _ in range(k)]
-        for i, tok in enumerate(tokens):
-            buckets[i % k].append(tok)
-        return [" ".join(b).strip() for b in buckets]
-
-    return [text] if text else []
-
-
-# ADD: parse any DE/.../EN matrix row into english key + per-contact values
-def parse_contact_matrix(page_text: str) -> tuple[list[int], list[tuple[str, list[str]]]]:
-    cols = detect_contact_columns(page_text)
-    k = max(len(cols), 1)
-
-    rows: list[tuple[str, list[str]]] = []
-    # line ends with English label; middle holds per-contact cells; allow ragged spacing
-    rx = re.compile(r"(?m)^(?P<de>.+?)\s{2,}(?P<middle>.+?)\s{2,}(?P<en>[A-Za-z][A-Za-z0-9 ().,°/%+-]+)\s*$")
-    for m in rx.finditer(page_text):
-        en = m.group("en").strip()
-        if re.search(r"(?i)\bnumber of contacts\b", en):
-            continue  # skip the header row
-        key = to_snake_case(en)
-        middle = m.group("middle")
-
-        cells = split_cells(middle, k)
-        # enforce English half when a cell contains "de/en"
-        cells = [c.split("/")[-1].strip() for c in cells]
-
-        # pad/trim to k columns
-        if len(cells) < k:
-            cells += [""] * (k - len(cells))
-        elif len(cells) > k:
-            cells = cells[:k]
-
-        rows.append((key, cells))
-
-    return cols, rows
 
 def extract_spec_labels(page_text: str) -> list[str]:
     labels: list[str] = []
@@ -300,42 +120,70 @@ def extract_spec_labels(page_text: str) -> list[str]:
     return labels
 
 
-# ADD
 def extract_spec_values(page_text: str, expected_count: int) -> list[str]:
     lines = page_text.splitlines()
-    start = 0
 
-    # start just after the last small-table header
+    # 1) Find the 'Polzahl Number of contacts' spec header
+    start = None
     for i, line in enumerate(lines):
-        if "Contacts Cable outlet Ordering-No." in line:
-            start = i + 1
+        if "Polzahl" in line and "Number of contacts" in line:
+            start = i
+            break
+    if start is None:
+        return []
 
+    # 2) Walk label lines (DE+EN) to find the end of the header block
+    label_pattern = re.compile(
+        r"(.+?)\s+([A-Z][A-Za-z0-9 ().,°/%+-]*(?:\s+[A-Za-z][A-Za-z0-9 ().,°/%+-]*)*)$"
+    )
+    last_label_idx = None
+
+    for j in range(start + 1, len(lines)):
+        line = lines[j].strip()
+        if not line:
+            continue
+        if label_pattern.match(line):
+            last_label_idx = j
+            continue
+        # after seen at least one label, the first non-matching line ends the block
+        if last_label_idx is not None:
+            break
+
+    if last_label_idx is None:
+        return []
+
+    # 3) Everything after the label block (non-empty lines) are value rows
     values: list[str] = []
-    started = False
-
-    for line in lines[start:]:
+    for line in lines[last_label_idx + 1:]:
         line = line.strip()
         if not line:
             continue
 
-        # detect ordering / small-table noise
-        has_code = re.search(r"(?:9\d)\s+\d{3,4}\s+\d{3,4}\s+\d{2}", line)
-        polzahl_row = re.fullmatch(r"(?:\d+\s+)+\d+", line)
-        mm_and_code = ("mm" in line) and has_code
-
-        if not started and (has_code or polzahl_row or mm_and_code):
-            # still in ordering-table block, skip
-            continue
-
-        # first non-table line = first spec value
-        if not started:
-            started = True
+        if not values:
+            # skip obvious blueprint/legend noise:
+            #  - pure numbers or tiny tokens
+            #  - tokens like "Ø", "1 x", "21M", "SW 18mm", "3 4 5 8 12"
+            if re.fullmatch(r"[\d\s,~xØ°A-Za-z]+", line) and len(line) <= 11:
+                continue
 
         values.append(line)
         if len(values) >= expected_count:
             break
 
+
     return values
+
+
+def parse_contact_header(page_text: str) -> list[int]:
+    """
+    Extract contact column numbers from the Polzahl header row, e.g.
+      'Polzahl 4 5 Number of contacts'  -> [4, 5]
+    """
+    for line in page_text.splitlines():
+        if "Number of contacts" in line:
+            nums = re.findall(r"\b(\d{1,2})\b", line)
+            return [int(n) for n in nums]
+    return []
 
 
 def build_contact_value_map(page_text: str, table_contacts: list[int]) -> dict[int, dict[str, str]]:
@@ -364,8 +212,55 @@ def build_contact_value_map(page_text: str, table_contacts: list[int]) -> dict[i
             continue
 
         # English side for bilingual cells
+        # English side for bilingual cells
         val = normalize_bilingual_value(raw_val)
+        
+        raw_lower = raw_val.lower()
+        contact_set = sorted(contacts) if contacts else []
 
+        
+        # termination: "schrauben/screw löten/solder" → first 4 screw, last solder
+        if (
+            contacts
+            and contact_set == [3, 4, 5, 8, 12]
+            and key == "termination"
+            and ("screw" in raw_lower)
+            and ("solder" in raw_lower)
+        ):
+            for c in contacts[:-1]:
+                per_contact.setdefault(c, {})[key] = "screw"
+            per_contact.setdefault(contacts[-1], {})[key] = "solder"
+            continue
+
+        # mechanical operation: "> 50 ...  > 100 ..." → 3/4/5 : >50, 8/12 : >100
+        if (
+            contacts
+            and contact_set == [3, 4, 5, 8, 12]
+            and key == "mechanical_operation"
+            and ("> 50" in raw_lower or "≥ 50" in raw_lower)
+            and ("> 100" in raw_lower or "≥ 100" in raw_lower)
+        ):
+            for c in contacts[:3]:
+                per_contact.setdefault(c, {})[key] = "> 50 mating cycles"
+            for c in contacts[3:]:
+                per_contact.setdefault(c, {})[key] = "> 100 mating cycles"
+            continue
+
+        # contact plating: "CuSnZn (Optalloy/optalloy) Au (Gold/gold)" → 3/4/5 optalloy, 8/12 gold
+        if (
+            contacts
+            and contact_set == [3, 4, 5, 8, 12]
+            and key == "contact_plating"
+            and ("optalloy" in raw_lower)
+            and ("au" in raw_lower)
+        ):
+            opt = "CuSnZn (Optalloy/optalloy)"
+            gold = "Au (gold)"
+            for c in contacts[:3]:
+                per_contact.setdefault(c, {})[key] = opt
+            for c in contacts[3:]:
+                per_contact.setdefault(c, {})[key] = gold
+            continue
 
         # tokens like '250 V', '60 V', '4 A', '8 mm', 'IP67'
         tokens = re.findall(
@@ -373,56 +268,64 @@ def build_contact_value_map(page_text: str, table_contacts: list[int]) -> dict[i
             raw_val,
         )
 
-        if contacts and len(tokens) == len(contacts) and len(tokens) > 1:
-            # map positionally: first token -> first contact, etc.
-            for c, tok in zip(contacts, tokens):
-                per_contact.setdefault(c, {})[key] = tok.strip()
-        else:
-            # shared value: same for all contacts
-            if per_contact:
+        if contacts and tokens:
+            n_contacts = len(contacts)
+            n_tokens = len(tokens)
+
+            # Used for rated_voltage, rated_impulse_voltage, rated_current_40_c.
+            # Special case for binder summary layout: 5 contacts (3,4,5,8,12) & 3 tokens
+            if contact_set == [3, 4, 5, 8, 12] and n_tokens == 3 and n_contacts == 5:
+                if key in ("rated_voltage", "rated_impulse_voltage"):
+                    groups = [2, 1, 2]   # 3&4 → first; 5 → middle; 8&12 → last
+                elif key == "rated_current_40_c":
+                    groups = [3, 1, 1]   # 3&4&5 → first; 8 → middle; 12 → last
+                else:
+                    groups = None
+
+                if groups:
+                    idx = 0
+                    for tok, g in zip(tokens, groups):
+                        for c in contacts[idx : idx + g]:
+                            per_contact.setdefault(c, {})[key] = tok.strip()
+                        idx += g
+                    continue
+
+            if n_tokens == n_contacts and n_tokens > 1:
+                # 1:1 mapping
+                for c, tok in zip(contacts, tokens):
+                    per_contact.setdefault(c, {})[key] = tok.strip()
+
+            elif 1 < n_tokens < n_contacts:
+                # Generic grouped mapping: distribute as evenly as possible
+                base = n_contacts // n_tokens
+                extra = n_contacts % n_tokens
+                groups = []
+                for i in range(n_tokens):
+                    size = base + (1 if i < extra else 0)
+                    groups.append(max(size, 1))
+
+                idx = 0
+                for tok, g in zip(tokens, groups):
+                    for c in contacts[idx : idx + g]:
+                        per_contact.setdefault(c, {})[key] = tok.strip()
+                    idx += g
+
+            elif n_tokens > n_contacts and n_contacts > 1:
+                # Too many tokens: best-effort positional
+                for c, tok in zip(contacts, tokens[:n_contacts]):
+                    per_contact.setdefault(c, {})[key] = tok.strip()
+
+            else:
+                # Single token or no sensible split: shared
                 for c in contacts:
-                    per_contact[c].setdefault(key, val)
+                    per_contact.setdefault(c, {}).setdefault(key, val)
+        else:
+            # No numeric cues: treat as shared spec if not already set
+            if contacts:
+                for c in contacts:
+                    per_contact.setdefault(c, {}).setdefault(key, val)
             else:
                 shared_only[key] = val
 
+
     return per_contact or ({0: shared_only} if shared_only else {})
-
-
-
-def infer_contacts_from_polzahl_block(page_text: str) -> list[int]:
-    """
-    Infer contact counts from the Polzahl/ordering tables.
-
-    Looks between the 'Polzahl Kabeldurchlass Bestell-Nr.' header
-    and the start of the spec rows and collects numbers like 3,4,5,8,12.
-    """
-    lines = page_text.splitlines()
-    start = None
-    for i, line in enumerate(lines):
-        if "Polzahl Kabeldurchlass Bestell-Nr." in line:
-            start = i
-    if start is None:
-        return []
-
-    nums = set()
-    for line in lines[start + 1 : start + 15]:
-        line = line.strip()
-        # stop when we reach the spec header block
-        if "Connector locking system" in line:
-            break
-        # collect plausible Polzahl values
-        for n in re.findall(r"\b([3-9]|1[0-2])\b", line):
-            nums.add(int(n))
-
-    return sorted(nums)
-
-def parse_contact_header(page_text: str) -> list[int]:
-    """
-    Extract contact column numbers from the Polzahl header row, e.g.
-      'Polzahl 4 5 Number of contacts'  -> [4, 5]
-    """
-    for line in page_text.splitlines():
-        if "Number of contacts" in line:
-            nums = re.findall(r"\b(\d{1,2})\b", line)
-            return [int(n) for n in nums]
-    return []
